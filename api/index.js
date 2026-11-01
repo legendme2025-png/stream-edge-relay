@@ -3,6 +3,56 @@ export const config = {
   regions: ['iad1'], // 100% Washington D.C., USA
 };
 
+// Helper: Generates random token string required by streaming CDNs
+function makeId(length) {
+  let result = '';
+  const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  for (let i = 0; i < length; i++) {
+    result += characters.charAt(Math.floor(Math.random() * characters.length));
+  }
+  return result;
+}
+
+// 1. SMART RESOLVER FOR DOODSTREAM (Bypasses Client-Side CORS & Token Loop)
+async function resolveDoodstream(targetUrl) {
+  try {
+    const parsed = new URL(targetUrl);
+    const origin = `${parsed.protocol}//${parsed.host}`;
+
+    // Step A: Fetch embed HTML from Washington D.C.
+    const res = await fetch(targetUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Referer': origin + '/',
+      },
+    });
+    const html = await res.text();
+
+    // Step B: Extract pass_md5 token path
+    const passMatch = html.match(/\/pass_md5\/([a-zA-Z0-9\-_]+)/);
+    if (!passMatch) return null;
+
+    const passToken = passMatch[1];
+    const passUrl = `${origin}/pass_md5/${passToken}`;
+
+    // Step C: Fetch the CDN base URL from Washington D.C. (Zero CORS)
+    const passRes = await fetch(passUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Referer': targetUrl,
+      },
+    });
+    const baseVideoUrl = (await passRes.text()).trim();
+    if (!baseVideoUrl.startsWith('http')) return null;
+
+    // Step D: Build final direct MP4 streaming link
+    const finalMp4 = `${baseVideoUrl}${makeId(10)}?token=${passToken}&expiry=${Date.now()}`;
+    return { finalMp4, origin };
+  } catch (err) {
+    return null;
+  }
+}
+
 export default async function handler(req) {
   // Handle CORS preflight
   if (req.method === 'OPTIONS') {
@@ -18,8 +68,9 @@ export default async function handler(req) {
 
   const url = new URL(req.url);
   const targetUrl = url.searchParams.get('url');
+  const customRef = url.searchParams.get('ref');
 
-  // If visiting the root link without ?url=, show an instant web player interface
+  // Homepage: If no ?url= provided
   if (!targetUrl) {
     const html = `<!DOCTYPE html>
     <html lang="en">
@@ -39,8 +90,8 @@ export default async function handler(req) {
     </head>
     <body>
       <div class="card">
-        <h2>⚡ US Edge Relay Active</h2>
-        <p>Connected to <b>Washington D.C. (iad1)</b>. Enter your Doodstream or blocked video link:</p>
+        <h2>⚡ US Edge Cinema Relay Active</h2>
+        <p>Connected to <b>Washington D.C. (iad1)</b>. Enter your video link:</p>
         <form action="/" method="GET">
           <input type="text" name="url" placeholder="https://doodstream.com/e/..." required>
           <button type="submit">▶ Unblock & Stream Video</button>
@@ -55,18 +106,48 @@ export default async function handler(req) {
     });
   }
 
+  // 2. CHECK IF THIS IS A DOODSTREAM LINK (Auto-activate Smart Resolver)
+  const isDood = /dood|ds2play|doodstream|doodcdn/i.test(targetUrl);
+  if (isDood && (targetUrl.includes('/e/') || targetUrl.includes('/d/'))) {
+    const resolved = await resolveDoodstream(targetUrl);
+    if (resolved) {
+      // Serve clean, ad-free Cinema Player that never loops
+      const cinemaPlayerHtml = `<!DOCTYPE html>
+      <html>
+      <head>
+        <title>🎬 Cinema Player</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+          body { margin:0; background:#000; display:flex; align-items:center; justify-content:center; height:100vh; overflow:hidden; }
+          video { width:100%; height:100%; max-height:100vh; outline:none; }
+        </style>
+      </head>
+      <body>
+        <video controls autoplay playsinline preload="auto">
+          <source src="/?url=${encodeURIComponent(resolved.finalMp4)}&ref=${encodeURIComponent(resolved.origin)}" type="video/mp4">
+        </video>
+      </body>
+      </html>`;
+
+      return new Response(cinemaPlayerHtml, {
+        status: 200,
+        headers: { 'Content-Type': 'text/html; charset=utf-8' },
+      });
+    }
+  }
+
+  // 3. GENERAL PROXY FOR DIRECT MP4 / VIDEO STREAMS & OTHER WEBSITES
   try {
     const parsedTarget = new URL(targetUrl);
-    const origin = `${parsedTarget.protocol}//${parsedTarget.host}`;
+    const origin = customRef || `${parsedTarget.protocol}//${parsedTarget.host}`;
 
     const forwardHeaders = new Headers();
     forwardHeaders.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
     forwardHeaders.set('Accept', '*/*');
-    forwardHeaders.set('Accept-Language', 'en-US,en;q=0.9');
     forwardHeaders.set('Referer', origin + '/');
     forwardHeaders.set('Origin', origin);
 
-    // Forward range headers so video seeking works smoothly
+    // Forward range headers so video seeking works
     if (req.headers.has('range')) {
       forwardHeaders.set('range', req.headers.get('range'));
     }
@@ -90,7 +171,7 @@ export default async function handler(req) {
     respHeaders.set('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
     respHeaders.set('Access-Control-Expose-Headers', 'Content-Range, Content-Length, Accept-Ranges');
 
-    // If HTML: Inject <base> so all internal scripts, tokens, and players load correctly
+    // For general websites
     if (contentType.includes('text/html')) {
       let html = await upstream.text();
       const baseTag = `<base href="${origin}/">`;
